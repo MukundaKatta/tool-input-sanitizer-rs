@@ -1,0 +1,13 @@
+[package]
+name = "tool-input-sanitizer"
+version = "0.1.0"
+edition = "2021"
+description = "Sanitize and normalize LLM tool call inputs before execution"
+license = "MIT"
+repository = "https://github.com/MukundaKatta/tool-input-sanitizer-rs"
+keywords = ["llm", "agent", "sanitize", "tools", "security"]
+categories = ["development-tools"]
+exclude = ["target/*", ".github/*", "*.log"]
+
+[dependencies]
+serde_json = "1"
