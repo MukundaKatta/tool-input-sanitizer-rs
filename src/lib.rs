@@ -1,5 +1,14 @@
 /*!
-tool-input-sanitizer: sanitize and normalize LLM tool call inputs.
+`tool-input-sanitizer`: sanitize, normalize, and validate LLM tool call inputs
+before you hand them to real code.
+
+Large language models routinely emit tool/function call arguments that are
+*almost* right: padded with whitespace, wrapped in stray markdown, the wrong
+case, far longer than your backend allows, or simply missing. This crate lets
+you declare per-field [`SanitizeRule`]s once and apply them to every incoming
+tool call, so the rest of your program can trust its inputs.
+
+# Quick start
 
 ```rust
 use tool_input_sanitizer::{InputSanitizer, SanitizeRule};
@@ -8,10 +17,51 @@ use serde_json::json;
 let mut s = InputSanitizer::new();
 s.add_rule("query", SanitizeRule::TrimWhitespace);
 s.add_rule("query", SanitizeRule::MaxLength(100));
-let result = s.sanitize("search", &json!({"query": "  hello world  "})).unwrap();
+
+let result = s
+    .sanitize("search", &json!({"query": "  hello world  "}))
+    .unwrap();
 assert_eq!(result["query"], "hello world");
 ```
+
+# Normalization vs. validation
+
+Most rules *normalize* (they always succeed and transform the value in place):
+[`SanitizeRule::TrimWhitespace`], [`SanitizeRule::MaxLength`],
+[`SanitizeRule::Lowercase`], [`SanitizeRule::Uppercase`],
+[`SanitizeRule::StripChars`], and [`SanitizeRule::DefaultOnNull`].
+
+A few rules *validate* (they leave the value untouched but return a
+[`SanitizeError`] when the input is unacceptable): [`SanitizeRule::Required`],
+[`SanitizeRule::NonEmpty`], [`SanitizeRule::MaxLengthError`], and
+[`SanitizeRule::OneOf`]. Mixing the two lets you both clean up sloppy input and
+reject input that can never be made valid:
+
+```rust
+use tool_input_sanitizer::{InputSanitizer, SanitizeRule};
+use serde_json::json;
+
+let mut s = InputSanitizer::new();
+s.add_rule("mode", SanitizeRule::TrimWhitespace);
+s.add_rule("mode", SanitizeRule::Lowercase);
+s.add_rule(
+    "mode",
+    SanitizeRule::OneOf(vec!["read".into(), "write".into()]),
+);
+
+// Normalized then accepted.
+assert_eq!(
+    s.sanitize("fs", &json!({"mode": " READ "})).unwrap()["mode"],
+    "read"
+);
+
+// Normalized then rejected.
+assert!(s.sanitize("fs", &json!({"mode": "delete"})).is_err());
+```
 */
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+#![doc(html_root_url = "https://docs.rs/tool-input-sanitizer")]
 
 use serde_json::Value;
 use std::collections::HashMap;
@@ -32,12 +82,38 @@ pub enum SanitizeRule {
     StripChars(String),
     /// Replace nulls with a default value.
     DefaultOnNull(Value),
+    /// Require the field to be present and non-null.
+    ///
+    /// Unlike [`SanitizeRule::DefaultOnNull`], this is a *validation* rule: a
+    /// missing or null field produces a [`SanitizeError`] instead of being
+    /// filled in. Useful for arguments the tool genuinely cannot run without.
+    Required,
+    /// Reject empty strings.
+    ///
+    /// Non-string values pass through unchanged. Add
+    /// [`SanitizeRule::TrimWhitespace`] before this rule to also reject
+    /// whitespace-only strings.
+    NonEmpty,
+    /// Reject strings longer than `N` characters with a [`SanitizeError`].
+    ///
+    /// Contrast with [`SanitizeRule::MaxLength`], which silently truncates.
+    /// Use this when over-long input signals a bug or abuse rather than
+    /// something to quietly fix.
+    MaxLengthError(usize),
+    /// Reject string values that are not one of the allowed options.
+    ///
+    /// Comparison is exact and case-sensitive; normalize first (e.g. with
+    /// [`SanitizeRule::Lowercase`]) if you want case-insensitive matching.
+    /// Non-string values pass through unchanged.
+    OneOf(Vec<String>),
 }
 
-/// Errors from sanitization.
-#[derive(Debug)]
+/// An error produced when a validation rule rejects a field value.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SanitizeError {
+    /// Name of the field that failed validation.
     pub field: String,
+    /// Human-readable description of why the field was rejected.
     pub message: String,
 }
 
@@ -57,15 +133,38 @@ pub struct InputSanitizer {
 }
 
 impl InputSanitizer {
-    pub fn new() -> Self { Self::default() }
+    /// Create an empty sanitizer with no rules.
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     /// Add a rule for `field`.
-    pub fn add_rule(&mut self, field: &str, rule: SanitizeRule) {
+    ///
+    /// Rules for the same field are applied in insertion order, so you can
+    /// chain a normalizer before a validator (e.g. trim, then `NonEmpty`).
+    /// Returns `&mut self` so calls can be chained in a builder style.
+    pub fn add_rule(&mut self, field: &str, rule: SanitizeRule) -> &mut Self {
         self.rules.entry(field.to_string()).or_default().push(rule);
+        self
+    }
+
+    /// Return the number of distinct fields that have at least one rule.
+    pub fn field_count(&self) -> usize {
+        self.rules.len()
     }
 
     /// Sanitize a JSON object `args` for `tool_name`.
-    /// Returns a new object with rules applied to matching fields.
+    ///
+    /// Returns a new object with rules applied to matching fields. Fields that
+    /// have no rules are passed through untouched, and a non-object `args`
+    /// value (array, string, number, etc.) is returned unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`SanitizeError`] if any validation rule
+    /// ([`SanitizeRule::Required`], [`SanitizeRule::NonEmpty`],
+    /// [`SanitizeRule::MaxLengthError`], or [`SanitizeRule::OneOf`]) rejects a
+    /// value. Evaluation stops at the first failing rule.
     pub fn sanitize(&self, _tool_name: &str, args: &Value) -> Result<Value, SanitizeError> {
         let obj = match args.as_object() {
             Some(o) => o,
@@ -79,10 +178,19 @@ impl InputSanitizer {
                     *val = apply_rule(field, val, rule)?;
                 }
             } else {
-                // Apply DefaultOnNull if field is absent.
+                // Field is absent: only a few rules are meaningful here.
                 for rule in rules {
-                    if let SanitizeRule::DefaultOnNull(default) = rule {
-                        result.insert(field.clone(), default.clone());
+                    match rule {
+                        SanitizeRule::DefaultOnNull(default) => {
+                            result.insert(field.clone(), default.clone());
+                        }
+                        SanitizeRule::Required => {
+                            return Err(SanitizeError {
+                                field: field.clone(),
+                                message: "required field is missing".to_string(),
+                            });
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -135,6 +243,50 @@ fn apply_rule(field: &str, val: &Value, rule: &SanitizeRule) -> Result<Value, Sa
             } else {
                 Ok(val.clone())
             }
+        }
+        SanitizeRule::Required => {
+            if val.is_null() {
+                Err(SanitizeError {
+                    field: field.to_string(),
+                    message: "required field is null".to_string(),
+                })
+            } else {
+                Ok(val.clone())
+            }
+        }
+        SanitizeRule::NonEmpty => {
+            if let Some(s) = val.as_str() {
+                if s.is_empty() {
+                    return Err(SanitizeError {
+                        field: field.to_string(),
+                        message: "value must not be empty".to_string(),
+                    });
+                }
+            }
+            Ok(val.clone())
+        }
+        SanitizeRule::MaxLengthError(n) => {
+            if let Some(s) = val.as_str() {
+                let len = s.chars().count();
+                if len > *n {
+                    return Err(SanitizeError {
+                        field: field.to_string(),
+                        message: format!("value is too long: {len} chars (max {n})"),
+                    });
+                }
+            }
+            Ok(val.clone())
+        }
+        SanitizeRule::OneOf(allowed) => {
+            if let Some(s) = val.as_str() {
+                if !allowed.iter().any(|a| a == s) {
+                    return Err(SanitizeError {
+                        field: field.to_string(),
+                        message: format!("value '{s}' is not one of the allowed options"),
+                    });
+                }
+            }
+            Ok(val.clone())
         }
     }
 }
@@ -252,7 +404,145 @@ mod tests {
 
     #[test]
     fn error_display() {
-        let e = SanitizeError { field: "q".into(), message: "bad".into() };
+        let e = SanitizeError {
+            field: "q".into(),
+            message: "bad".into(),
+        };
         assert!(e.to_string().contains("q"));
+    }
+
+    #[test]
+    fn required_present_ok() {
+        let mut s = InputSanitizer::new();
+        s.add_rule("q", SanitizeRule::Required);
+        let r = s.sanitize("fn", &json!({"q": "x"})).unwrap();
+        assert_eq!(r["q"], "x");
+    }
+
+    #[test]
+    fn required_missing_errors() {
+        let mut s = InputSanitizer::new();
+        s.add_rule("q", SanitizeRule::Required);
+        let err = s.sanitize("fn", &json!({})).unwrap_err();
+        assert_eq!(err.field, "q");
+        assert!(err.message.contains("missing"));
+    }
+
+    #[test]
+    fn required_null_errors() {
+        let mut s = InputSanitizer::new();
+        s.add_rule("q", SanitizeRule::Required);
+        let err = s.sanitize("fn", &json!({"q": null})).unwrap_err();
+        assert_eq!(err.field, "q");
+        assert!(err.message.contains("null"));
+    }
+
+    #[test]
+    fn non_empty_rejects_empty_string() {
+        let mut s = InputSanitizer::new();
+        s.add_rule("q", SanitizeRule::NonEmpty);
+        assert!(s.sanitize("fn", &json!({"q": ""})).is_err());
+    }
+
+    #[test]
+    fn non_empty_accepts_non_empty_string() {
+        let mut s = InputSanitizer::new();
+        s.add_rule("q", SanitizeRule::NonEmpty);
+        assert!(s.sanitize("fn", &json!({"q": "ok"})).is_ok());
+    }
+
+    #[test]
+    fn non_empty_after_trim_rejects_whitespace_only() {
+        let mut s = InputSanitizer::new();
+        s.add_rule("q", SanitizeRule::TrimWhitespace);
+        s.add_rule("q", SanitizeRule::NonEmpty);
+        assert!(s.sanitize("fn", &json!({"q": "   "})).is_err());
+    }
+
+    #[test]
+    fn non_empty_ignores_non_strings() {
+        let mut s = InputSanitizer::new();
+        s.add_rule("n", SanitizeRule::NonEmpty);
+        assert!(s.sanitize("fn", &json!({"n": 0})).is_ok());
+    }
+
+    #[test]
+    fn max_length_error_rejects_too_long() {
+        let mut s = InputSanitizer::new();
+        s.add_rule("q", SanitizeRule::MaxLengthError(3));
+        let err = s.sanitize("fn", &json!({"q": "hello"})).unwrap_err();
+        assert_eq!(err.field, "q");
+        assert!(err.message.contains("too long"));
+    }
+
+    #[test]
+    fn max_length_error_accepts_within_limit() {
+        let mut s = InputSanitizer::new();
+        s.add_rule("q", SanitizeRule::MaxLengthError(5));
+        assert!(s.sanitize("fn", &json!({"q": "hello"})).is_ok());
+    }
+
+    #[test]
+    fn max_length_error_counts_chars_not_bytes() {
+        let mut s = InputSanitizer::new();
+        s.add_rule("q", SanitizeRule::MaxLengthError(3));
+        // "héllo" is 5 chars but more than 5 bytes; must reject on char count.
+        assert!(s.sanitize("fn", &json!({"q": "héllo"})).is_err());
+        assert!(s.sanitize("fn", &json!({"q": "hél"})).is_ok());
+    }
+
+    #[test]
+    fn one_of_accepts_allowed() {
+        let mut s = InputSanitizer::new();
+        s.add_rule(
+            "mode",
+            SanitizeRule::OneOf(vec!["read".into(), "write".into()]),
+        );
+        assert!(s.sanitize("fn", &json!({"mode": "read"})).is_ok());
+    }
+
+    #[test]
+    fn one_of_rejects_disallowed() {
+        let mut s = InputSanitizer::new();
+        s.add_rule(
+            "mode",
+            SanitizeRule::OneOf(vec!["read".into(), "write".into()]),
+        );
+        let err = s.sanitize("fn", &json!({"mode": "delete"})).unwrap_err();
+        assert_eq!(err.field, "mode");
+        assert!(err.message.contains("delete"));
+    }
+
+    #[test]
+    fn normalize_then_validate_pipeline() {
+        let mut s = InputSanitizer::new();
+        s.add_rule("mode", SanitizeRule::TrimWhitespace);
+        s.add_rule("mode", SanitizeRule::Lowercase);
+        s.add_rule(
+            "mode",
+            SanitizeRule::OneOf(vec!["read".into(), "write".into()]),
+        );
+        let r = s.sanitize("fn", &json!({"mode": "  READ "})).unwrap();
+        assert_eq!(r["mode"], "read");
+        assert!(s.sanitize("fn", &json!({"mode": "  DELETE "})).is_err());
+    }
+
+    #[test]
+    fn add_rule_is_chainable() {
+        let mut s = InputSanitizer::new();
+        s.add_rule("q", SanitizeRule::TrimWhitespace)
+            .add_rule("q", SanitizeRule::Uppercase);
+        let r = s.sanitize("fn", &json!({"q": "  hi "})).unwrap();
+        assert_eq!(r["q"], "HI");
+    }
+
+    #[test]
+    fn field_count_tracks_distinct_fields() {
+        let mut s = InputSanitizer::new();
+        assert_eq!(s.field_count(), 0);
+        s.add_rule("a", SanitizeRule::TrimWhitespace);
+        s.add_rule("a", SanitizeRule::Uppercase);
+        s.add_rule("b", SanitizeRule::Lowercase);
+        assert_eq!(s.field_count(), 2);
     }
 }
